@@ -1,12 +1,35 @@
+// Experimental SSL Tests
+// --------------------------------------------------------------------------------------------------
+// 1) Generate manually certificates cert.pem and key.pem using template 'localhost.conf' and scripts:
+// https://unix.stackexchange.com/questions/288517/how-to-make-self-signed-certificate-for-localhost
+// 2) Implement SSL support in cmd/muxservice/main.go using references bellow:
+// https://www.kaihag.com/https-and-go/
+// https://github.com/kabukky/httpscerts/blob/master/httpscerts.go
+// Other reference: https://github.com/denji/golang-tls
+// --------------------------------------------------------------------------------------------------
+// Suggestion - Implement a Certificate Authority:
+// https://random-notes-of-a-sysadmin.blogspot.com.br/2016/06/howto-setup-fips-compliant-root.html
+// https://www.medo64.com/2017/03/creating-your-own-certificate-authority/
+// https://andrewlock.net/creating-and-trusting-a-self-signed-certificate-on-linux-for-use-in-kestrel-and-asp-net-core/
+
 package muxservice
 
 import (
 	"crypto/ecdsa"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io/ioutil"
+	"math/big"
+	"net"
 	"net/http"
+	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/decred/dcrd/dcrutil"
@@ -22,11 +45,16 @@ import (
 const (
 	privKeyPath      = "rpc.key"
 	pubKeyPath       = "rpc.cert"
+	pemKeyPath       = "key.pem"
+	pemCertPath      = "cert.pem"
 	userName         = "Decred Pi Wallet"
 	tokenTimeoutHour = 10
 )
 
 var (
+	validFrom = ""
+	validFor  = 365 * 24 * time.Hour
+	isCA      = true
 	corsArray = []string{"http://localhost"}
 	verifyKey *ecdsa.PublicKey
 	ecdsaKey  *ecdsa.PrivateKey
@@ -35,28 +63,139 @@ var (
 	logger    = config.MuxsLog
 )
 
-func fatal(err error) {
+func logFatal(err error) {
 	if err != nil {
-		log.Critical(err)
+		logger.Critical(err)
 	}
 }
 
-func initKeys() {
+func initKeys() error {
 	dcrwalletHomeDir := dcrutil.AppDataDir("dcrwallet", false)
 
 	logger.Debugf("Reading private key %s", privKeyPath)
 	signBytes, err := ioutil.ReadFile(filepath.Join(dcrwalletHomeDir, privKeyPath))
-	fatal(err)
+	logFatal(err)
 
 	ecdsaKey, err = jwt.ParseECPrivateKeyFromPEM(signBytes)
-	fatal(err)
+	logFatal(err)
 
 	logger.Debugf("Reading public key %s", pubKeyPath)
 	verifyBytes, err := ioutil.ReadFile(filepath.Join(dcrwalletHomeDir, pubKeyPath))
-	fatal(err)
+	logFatal(err)
 
 	verifyKey, err = jwt.ParseECPublicKeyFromPEM(verifyBytes)
-	fatal(err)
+	logFatal(err)
+
+	logger.Debugf("Reading private certificate %s", pemKeyPath)
+	pemSignBytes, err := ioutil.ReadFile(pemKeyPath)
+	if err != nil {
+		err = generatePrivateCertificate(pemSignBytes)
+		logFatal(err)
+	}
+
+	return err
+}
+
+func generatePrivateCertificate(signBytes []byte) error {
+	var err error
+	var notBefore time.Time
+	if len(validFrom) == 0 {
+		notBefore = time.Now()
+	} else {
+		notBefore, err = time.Parse("Jan 2 15:04:05 2006", validFrom)
+		if err != nil {
+			logger.Criticalf("Failed to parse creation date: %s\n", err)
+			return err
+		}
+	}
+
+	notAfter := notBefore.Add(validFor)
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		logger.Criticalf("failed to generate serial number: %s", err)
+		return err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{userName},
+		},
+		NotBefore: notBefore,
+		NotAfter:  notAfter,
+
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+	}
+
+	hosts := strings.Split(cfg.APIListen, ",")
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, h)
+		}
+	}
+
+	if isCA {
+		template.IsCA = true
+		template.KeyUsage |= x509.KeyUsageCertSign
+	}
+
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, publicKey(ecdsaKey), ecdsaKey)
+	if err != nil {
+		logFatal(err)
+	}
+
+	certOut, err := os.Create(pemCertPath)
+	if err != nil {
+		logger.Criticalf("failed to open "+pemCertPath+" for writing: %s", err)
+		return err
+	}
+	pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
+	certOut.Close()
+	logger.Debug("written cert.pem\n")
+
+	keyOut, err := os.OpenFile(pemKeyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		logger.Criticalf("failed to open "+pemKeyPath+" for writing:", err)
+		return err
+	}
+
+	b, err := x509.MarshalECPrivateKey(ecdsaKey)
+	if err != nil {
+		logger.Criticalf("Unable to marshal ECDSA private key: %v", err)
+		return err
+	}
+
+	pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: b})
+	keyOut.Close()
+	logger.Debug("written key.pem")
+
+	return nil
+}
+
+func publicKey(priv interface{}) interface{} {
+	switch k := priv.(type) {
+	case *rsa.PrivateKey:
+		return &k.PublicKey
+	case *ecdsa.PrivateKey:
+		return &k.PublicKey
+	default:
+		return nil
+	}
+}
+
+func checkSSL(certPath string, keyPath string) error {
+	if _, err := os.Stat(certPath); os.IsNotExist(err) {
+		return err
+	} else if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // UserCredentials stores data to login
@@ -116,7 +255,7 @@ func startServer() {
 
 	logger.Infof("Listening API at %s", cfg.APIListen)
 	// Bind to a port and pass our router in
-	logger.Critical(http.ListenAndServe(cfg.APIListen, router))
+	logger.Critical(http.ListenAndServeTLS(cfg.APIListen, pemCertPath, pemKeyPath, router))
 }
 
 func aboutHandler(w http.ResponseWriter, r *http.Request) {
@@ -129,7 +268,7 @@ func balanceHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, "Error getting Balance")
 		logger.Errorf("Error getting balance %v", err)
-		fatal(err)
+		logFatal(err)
 	}
 	jsonResponse(t, w)
 }
@@ -140,7 +279,7 @@ func ticketsHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, "Error getting Tickets")
 		logger.Errorf("Error getting tickets %v", err)
-		fatal(err)
+		logFatal(err)
 	}
 	jsonResponse(t, w)
 }
@@ -177,7 +316,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, "Error extracting the key")
 		logger.Errorf("Error extracting the key %v", err)
-		fatal(err)
+		logFatal(err)
 	}
 
 	tokenString, err := token.SignedString(ecdsaKey)
@@ -186,7 +325,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintln(w, "Error while signing the token")
 		logger.Errorf("Error while signing the token %v", err)
-		fatal(err)
+		logFatal(err)
 	}
 
 	response := Token{tokenString}
@@ -239,8 +378,10 @@ func Start(tcfg *config.Config, tclient *rpcclient.Client) {
 	config.InitLogRotator(cfg.LogFile)
 	UseLogger(logger)
 	logger.Infof("APIKey %s", cfg.APIKey)
-	initKeys()
-	startServer()
+	err := initKeys()
+	if err == nil {
+		startServer()
+	}
 
 	// Get the current block count.
 	/*blockCount, err := client.GetBlockCount()

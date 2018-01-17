@@ -17,6 +17,7 @@ $('document').ready(function() {
 function callbackBalance(result) {
     dcrAmount = result.amount;
     $('#balance-view h2').text("Balance: " + currencyApi.toUpperCase() + " " + (dcrAmount * priceApi).toFixed(2));
+    $('#balance-view h2').append(" (DCR " + dcrAmount + ")")
 }
 
 function callbackTickets(result) {
@@ -25,6 +26,7 @@ function callbackTickets(result) {
     live = result.live;
     totalSubsidy = result.totalSubsidy;
     selectedCurrency = currencyApi.toUpperCase();
+    $('#tickets-view h2').text("");
     $('#tickets-view h2').append("OwnMempool: " + selectedCurrency + " " + (ownMempool * priceApi).toFixed(2));
     $('#tickets-view h2').append(" | ");
     $('#tickets-view h2').append("Immature: " + selectedCurrency + " " + (immature * priceApi).toFixed(2));
@@ -67,6 +69,6 @@ function callPriceUpdate(tickerId, currency) {
           callbackPriceUpdate(result[0]["price_"+currency]);
         })
         .fail(function(err) {
-          $('#balance-view h2').text('Request failed: ' + err.statusText);
+          $('#balance-view h2').text('CoinMarketCap API Request failed: ' + err.statusText);
         });
 }
